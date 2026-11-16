@@ -309,12 +309,12 @@ async function runCli(options) {
         console.log(`\n⏳ Merging PR #${pr.number}: ${pr.title}`);
 
         let updatedHeadSha;
-        const freshPR = options.updateBranchBeforeMerge || mergeQueueMode !== 'false'
+        const freshPR = options.updateBranchBeforeMerge
           ? await checkPRMergeability(octokit, owner, repo, pr.number, options.retryDelayMs)
           : pr.prDetails;
 
-        if ((options.updateBranchBeforeMerge || mergeQueueMode !== 'false') && !freshPR?.mergeable) {
-          console.warn(`Skipping PR #${pr.number}: could not confirm mergeability`);
+        if (options.updateBranchBeforeMerge && !freshPR?.mergeable) {
+          console.warn(`Skipping PR #${pr.number}: could not confirm mergeability before branch update`);
           continue;
         }
 
