@@ -37785,6 +37785,92 @@ async function updatePRBranch(octokit, pullNumber, prDetails) {
 }
 
 /**
+ * Parse the merge-queue input
+ *
+ * @param {string} value - Raw input value (auto, true, false)
+ * @returns {'auto'|'true'|'false'} Normalized mode
+ */
+function parseMergeQueueMode(value) {
+  const mode = (value || 'auto').trim().toLowerCase();
+  if (!['auto', 'true', 'false'].includes(mode)) {
+    throw new Error(`Invalid merge-queue value '${value}'. Expected one of: auto, true, false`);
+  }
+  return mode;
+}
+
+/**
+ * Check whether a branch requires a merge queue via repository rulesets.
+ * Results are cached per branch in the provided Map.
+ *
+ * @param {Object} octokit - GitHub API client
+ * @param {string} owner - Repository owner
+ * @param {string} repo - Repository name
+ * @param {string} branch - Branch name
+ * @param {Map<string, boolean>} cache - Per-run cache keyed by branch name
+ * @returns {Promise<boolean>} True if the branch has a merge_queue rule
+ */
+async function branchHasMergeQueue(octokit, owner, repo, branch, cache = new Map()) {
+  if (cache.has(branch)) {
+    return cache.get(branch);
+  }
+
+  let hasQueue = false;
+  try {
+    const { data: rules } = await octokit.rest.repos.getBranchRules({
+      owner,
+      repo,
+      branch,
+      per_page: 100
+    });
+    hasQueue = Array.isArray(rules) && rules.some(rule => rule.type === 'merge_queue');
+    info(`Branch '${branch}' ${hasQueue ? 'requires' : 'does not require'} a merge queue`);
+  } catch (error) {
+    warning(`Could not detect merge queue for branch '${branch}': ${error.message}. Falling back to direct merge.`);
+  }
+
+  cache.set(branch, hasQueue);
+  return hasQueue;
+}
+
+/**
+ * Add a pull request to the merge queue using the GraphQL API
+ *
+ * @param {Object} octokit - GitHub API client
+ * @param {Object} prDetails - Fresh PR details including node ID and head SHA
+ * @param {string} [expectedHeadOid] - Expected head SHA, defaults to prDetails.head.sha
+ * @returns {Promise<{position: number, state: string}>} The merge queue entry
+ * @throws {Error} If the PR could not be enqueued
+ */
+async function enqueuePullRequest(octokit, prDetails, expectedHeadOid) {
+  if (!prDetails?.node_id) {
+    throw new Error('Missing PR node ID');
+  }
+
+  const result = await octokit.graphql(`
+    mutation EnqueuePullRequest($pullRequestId: ID!, $expectedHeadOid: GitObjectID) {
+      enqueuePullRequest(input: {
+        pullRequestId: $pullRequestId,
+        expectedHeadOid: $expectedHeadOid
+      }) {
+        mergeQueueEntry {
+          position
+          state
+        }
+      }
+    }
+  `, {
+    pullRequestId: prDetails.node_id,
+    expectedHeadOid: expectedHeadOid ?? prDetails.head?.sha
+  });
+
+  const entry = result?.enqueuePullRequest?.mergeQueueEntry;
+  if (!entry) {
+    throw new Error('GitHub did not return a merge queue entry');
+  }
+  return entry;
+}
+
+/**
  * Wait for checks to pass after updating a PR branch
  *
  * @param {Object} octokit - GitHub API client
@@ -37917,9 +38003,10 @@ function createTableHeader(columns) {
  * @param {Set<number>} mergedPRNumbers - Set of PR numbers that were successfully merged
  * @param {Object} filters - Filtering rules that were applied
  * @param {Array} initialPRs - Array of all initial PRs found (including those filtered in basic criteria)
+ * @param {Set<number>} queuedPRNumbers - Set of PR numbers that were added to a merge queue
  * @returns {Promise<void>}
  */
-async function addWorkflowSummary(allPRs, prsToMerge, mergedPRNumbers, filters, initialPRs = []) {
+async function addWorkflowSummary(allPRs, prsToMerge, mergedPRNumbers, filters, initialPRs = [], queuedPRNumbers = new Set()) {
   try {
     // Start with a header (or two)
     summary.addHeading('Dependabot Automerge Summary', 1);
@@ -37960,7 +38047,11 @@ async function addWorkflowSummary(allPRs, prsToMerge, mergedPRNumbers, filters, 
         summaryMessage += ` (out of ${initialPRs.length} total open PRs)`;
       }
       const mergedCount = mergedPRNumbers ? mergedPRNumbers.size : prsToMerge.length;
-      summaryMessage += `, ${mergedCount} merged.`;
+      summaryMessage += `, ${mergedCount} merged`;
+      if (queuedPRNumbers && queuedPRNumbers.size > 0) {
+        summaryMessage += `, ${queuedPRNumbers.size} added to merge queue`;
+      }
+      summaryMessage += '.';
       summary.addRaw(summaryMessage + '\n\n');
     }
     
@@ -37971,7 +38062,11 @@ async function addWorkflowSummary(allPRs, prsToMerge, mergedPRNumbers, filters, 
       const hasLabelFiltering = filters.alwaysAllowLabels && filters.alwaysAllowLabels.length > 0;
 
       const mergedPRs = prsToMerge.filter(pr => mergedPRNumbers && mergedPRNumbers.has(pr.number));
-      const skippedDuringMerge = prsToMerge.filter(pr => !mergedPRNumbers || !mergedPRNumbers.has(pr.number));
+      const queuedPRs = prsToMerge.filter(pr => queuedPRNumbers && queuedPRNumbers.has(pr.number));
+      const skippedDuringMerge = prsToMerge.filter(pr =>
+        (!mergedPRNumbers || !mergedPRNumbers.has(pr.number)) &&
+        (!queuedPRNumbers || !queuedPRNumbers.has(pr.number))
+      );
 
       const renderPRTable = (prs, title) => {
         if (prs.length === 0) return;
@@ -38018,6 +38113,7 @@ async function addWorkflowSummary(allPRs, prsToMerge, mergedPRNumbers, filters, 
       };
 
       renderPRTable(mergedPRs, 'Merged Pull Requests');
+      renderPRTable(queuedPRs, 'Queued Pull Requests (Merge Queue)');
 
       if (skippedDuringMerge.length > 0) {
         summary.addRaw(createSectionTitle('Pull Requests Skipped During Merge') + '\n\n');
@@ -38173,6 +38269,7 @@ async function run() {
     const updateBranchBeforeMerge = getInput('update-branch-before-merge') === 'true';
     const parsedMaxUpdateWait = parseInt(getInput('max-update-wait-seconds'), 10);
     const maxUpdateWaitSeconds = Number.isNaN(parsedMaxUpdateWait) ? 300 : parsedMaxUpdateWait;
+    const mergeQueueMode = parseMergeQueueMode(getInput('merge-queue'));
     
     // Prepare filter options - we'll use this regardless of whether we're in a blackout period
     const filterOptions = {
@@ -38190,6 +38287,10 @@ async function run() {
     let initialPRs = [];
     let mergedPRCount = 0;
     const mergedPRNumbers = new Set();
+    let queuedPRCount = 0;
+    const queuedPRNumbers = new Set();
+    const mergeQueueCache = new Map();
+    let defaultBranchName;
 
     // Check if the action should run at the current time
     if (!shouldRunAtCurrentTime(blackoutPeriods)) {
@@ -38212,13 +38313,17 @@ async function run() {
         if (currentRef !== defaultBranch) {
           warning(`Action is not running from the default branch (${repo.default_branch}). Current ref: ${currentRef}. Skipping execution for security reasons.`);
           setOutput('merged-pr-count', 0);
+          setOutput('queued-pr-count', 0);
           return 0;
         }
+
+        defaultBranchName = repo.default_branch;
         
         info(`Action is running from the default branch (${repo.default_branch}). Proceeding with execution.`);
       } catch (error) {
         warning(`Failed to verify default branch: ${error.message}. Skipping execution for security reasons.`);
         setOutput('merged-pr-count', 0);
+        setOutput('queued-pr-count', 0);
         return 0;
       }
       
@@ -38272,10 +38377,15 @@ async function run() {
             continue;
           }
 
+          const baseBranch = freshPRDetails.base?.ref || defaultBranchName;
+          const useMergeQueue = mergeQueueMode === 'true' ||
+            (mergeQueueMode === 'auto' && baseBranch !== undefined &&
+              await branchHasMergeQueue(octokit, context$1.repo.owner, context$1.repo.repo, baseBranch, mergeQueueCache));
+
           let updatedHeadSha;
 
-          // Check if branch needs updating and update-branch-before-merge is enabled
-          if (updateBranchBeforeMerge && freshPRDetails.mergeable_state === 'behind') {
+          // The merge queue tests against the latest base branch itself, so no branch update is needed
+          if (!useMergeQueue && updateBranchBeforeMerge && freshPRDetails.mergeable_state === 'behind') {
             info(`PR #${pr.number} branch is behind base branch. Updating...`);
             
             const updateSuccess = await updatePRBranch(
@@ -38324,6 +38434,26 @@ async function run() {
               recordFilterReason(pr.number, 'merge', 'Auto-approval failed');
               continue;
             }
+          }
+
+          if (useMergeQueue) {
+            try {
+              info(`Adding PR #${pr.number} to the merge queue: ${pr.title}`);
+              const entry = await enqueuePullRequest(octokit, freshPRDetails, updatedHeadSha ?? freshPRDetails.head?.sha);
+              info(`Added PR #${pr.number} to the merge queue (position: ${entry.position}, state: ${entry.state})`);
+              queuedPRCount++;
+              queuedPRNumbers.add(pr.number);
+            } catch (error) {
+              if (/already (in|added to) the merge queue|already queued/i.test(error.message || '')) {
+                info(`PR #${pr.number} is already in the merge queue`);
+                queuedPRCount++;
+                queuedPRNumbers.add(pr.number);
+              } else {
+                setFailed(`Failed to add PR #${pr.number} to the merge queue: ${error.message}`);
+                recordFilterReason(pr.number, 'merge', `Enqueue failed: ${error.message}`);
+              }
+            }
+            continue;
           }
 
             try {
@@ -38402,22 +38532,10 @@ async function run() {
                     await new Promise(resolve => setTimeout(resolve, retryDelayMs));
                   }
                 } else {
-                  // Check for merge queue warnings in the error message
-                  const isMergeQueueError = 
-                    (mergeError.message && (
-                      mergeError.message.toLowerCase().includes('merge queue') || 
-                      mergeError.message.toLowerCase().includes('branch protection') ||
-                      mergeError.message.toLowerCase().includes('required status check')
-                    )) ||
-                    (mergeError.status === 405 || mergeError.status === 422);
-                  
-                  // If this appears to be a merge queue error and merge method isn't 'merge'
-                  if (isMergeQueueError && mergeMethod !== 'merge') {
-                    warning(`PR #${pr.number} may require a merge queue, but merge method is set to '${mergeMethod}'. Only 'merge' method is supported with merge queues.`);
-                    warning('To use merge queues, change the \'merge-method\' input to \'merge\' in your workflow configuration.');
+                  if (mergeError.message && mergeError.message.toLowerCase().includes('merge queue')) {
+                    warning(`PR #${pr.number} must be merged through a merge queue. Set the 'merge-queue' input to 'auto' or 'true' to add it to the queue instead.`);
                   }
-                  
-                  // Always throw the error since we're not handling other types of merge errors
+
                   throw mergeError;
                 }
               }
@@ -38431,16 +38549,17 @@ async function run() {
     }
     
     // Always add workflow summary at the end with the final state
-    await addWorkflowSummary(pullRequests, filteredPRs, mergedPRNumbers, filterOptions, initialPRs);
+    await addWorkflowSummary(pullRequests, filteredPRs, mergedPRNumbers, filterOptions, initialPRs, queuedPRNumbers);
     
-    // Set the output for the number of merged PRs
     setOutput('merged-pr-count', mergedPRCount);
+    setOutput('queued-pr-count', queuedPRCount);
 
     return mergedPRCount;
 
   } catch (error) {
     setFailed(`Action failed: ${error.message}`);
     setOutput('merged-pr-count', 0);
+    setOutput('queued-pr-count', 0);
     return 0;
   }
 }

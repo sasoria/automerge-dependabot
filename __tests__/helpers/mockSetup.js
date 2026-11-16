@@ -5,6 +5,7 @@ import { jest } from '@jest/globals';
  */
 function createMockOctokit() {
   return {
+    graphql: jest.fn(),
     rest: {
       pulls: {
         merge: jest.fn(),
@@ -16,7 +17,8 @@ function createMockOctokit() {
       },
       repos: {
         getCombinedStatusForRef: jest.fn(),
-        get: jest.fn()
+        get: jest.fn(),
+        getBranchRules: jest.fn()
       },
       checks: {
         listForRef: jest.fn()
@@ -93,6 +95,7 @@ function setupDefaultMockResponses(mockOctokit) {
   mockOctokit.rest.checks.listForRef.mockResolvedValue({
     data: { check_runs: [] }
   });
+  mockOctokit.rest.repos.getBranchRules.mockResolvedValue({ data: [] });
 }
 
 /**

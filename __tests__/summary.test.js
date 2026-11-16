@@ -469,4 +469,20 @@ describe('addWorkflowSummary', () => {
 
     expect(mockSummary.write).toHaveBeenCalled();
   });
+
+  test('should show queued PRs separately from merged and skipped PRs', async () => {
+    const allPRs = [
+      { number: 1, html_url: 'https://github.com/owner/repo/pull/1', dependencyInfo: { name: 'lodash', toVersion: '4.17.21' } },
+      { number: 3, html_url: 'https://github.com/owner/repo/pull/3', dependencyInfo: { name: 'axios', toVersion: '0.21.4' } }
+    ];
+    const filters = { ignoredDependencies: [], alwaysAllow: [], ignoredVersions: [], semverFilter: ['patch', 'minor'] };
+
+    await addWorkflowSummary(allPRs, allPRs, new Set(), filters, allPRs, new Set([1, 3]));
+
+    const contents = mockSummary.addRaw.mock.calls.map(call => call[0]);
+    expect(contents.some(c => c.includes('Queued Pull Requests (Merge Queue)'))).toBe(true);
+    expect(contents.some(c => c.includes('0 merged, 2 added to merge queue.'))).toBe(true);
+    expect(contents.some(c => c.includes('Pull Requests Skipped During Merge'))).toBe(false);
+    expect(contents.some(c => c.includes('[#1]') && c.includes('lodash'))).toBe(true);
+  });
 });

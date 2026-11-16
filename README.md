@@ -25,7 +25,8 @@ This tool can be used in two ways:
 - Label-based filtering to bypass all filters for specific PRs
 - Robust version comparison using the official semver npm package
 - Detailed workflow summary with dependency decisions and PR status
-- Returns the number of merged PRs as the action output
+- Supports GitHub merge queues by adding PRs to the queue instead of merging directly
+- Returns the number of merged and queued PRs as action outputs
 
 ## Inputs
 
@@ -127,10 +128,10 @@ Comma-separated list of: `major`, `minor`, `patch`, `unknown`. Default: `patch,m
 
 ### `merge-method`
 
-The merge method to use when merging pull requests. Default: `merge`.
+The merge method to use when merging pull requests directly. Default: `merge`.
 Possible values: `merge`, `squash`, `rebase`.
 
-Note: If a repository uses GitHub branch protection with merge queues, only the `merge` method is supported. The action will warn you if you're trying to use `squash` or `rebase` with a repository that has merge queues enabled.
+Note: GitHub rejects direct merges into a branch that requires a merge queue, regardless of the merge method. When a PR is added to a merge queue (see [`merge-queue`](#merge-queue)), this setting is ignored and the merge method configured for the queue is used instead.
 
 ### `retry-delay-ms`
 
@@ -167,6 +168,29 @@ This setting only applies when `update-branch-before-merge` is enabled. After up
 - A new head is observed, its commits pass validation, and all checks pass (proceeds with merge)
 - Timeout is reached (skips PR)
 - Checks fail (skips PR)
+
+### `merge-queue`
+
+How to handle branches that require a [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue). Default: `auto`.
+Possible values:
+
+- `auto`: Detect a `merge_queue` rule on the PR's base branch (via the [branch rules API](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch)). If found, the PR is added to the merge queue, otherwise it is merged directly. Detection runs once per base branch per run. If detection fails, the action falls back to a direct merge.
+- `true`: Always add PRs to the merge queue, without detection.
+- `false`: Always merge directly.
+
+PRs are added to the queue with GitHub's `enqueuePullRequest` GraphQL mutation, pinned to the head SHA that was validated by the action. Since the merge queue tests each PR against the latest base branch itself, `update-branch-before-merge`, the `retry-delay-ms` delay between merges and the "base branch was modified" retry are skipped for queued PRs. Queued PRs are counted in the `queued-pr-count` output, not in `merged-pr-count`. A PR that is already in the queue is counted as queued. If a PR cannot be added to the queue, the action fails.
+
+Note: Merge queues are only detected from repository rulesets. Merge queues configured through classic branch protection rules are not visible to the branch rules API; use `merge-queue: 'true'` for those.
+
+## Outputs
+
+### `merged-pr-count`
+
+The number of pull requests that were merged directly during the run.
+
+### `queued-pr-count`
+
+The number of pull requests that were added to a merge queue during the run.
 
 ## Example usage
 
@@ -230,6 +254,7 @@ jobs:
           auto-approve: 'true'
           update-branch-before-merge: 'true'
           max-update-wait-seconds: '300'
+          merge-queue: 'auto'
 ```
 
 ## How It Works
@@ -255,15 +280,17 @@ jobs:
    - For multi-dependency PRs, ALL dependencies must pass filters
 7. Creates a detailed workflow summary showing which PRs will be merged and which were filtered out
 8. For each PR to merge:
-   - If update-branch-before-merge is enabled and PR branch is behind:
+   - If update-branch-before-merge is enabled, the PR branch is behind and no merge queue is used:
      - Updates the PR branch to sync with base branch
      - Waits for CI checks to pass (up to max-update-wait-seconds)
      - Skips PR if update fails or checks don't pass within timeout
+   - Detects whether the base branch requires a merge queue (see `merge-queue`)
    - If auto-approve is enabled, approves the PR first (skips PR if approval fails)
-   - Attempts to merge using the specified merge method
+   - If the base branch requires a merge queue, adds the PR to the queue and moves on to the next PR
+   - Otherwise attempts to merge using the specified merge method
    - If merge fails due to base branch modification, re-verifies mergeability and retries once
    - Waits retry-delay-ms between merges to allow GitHub to process changes
-9. Returns the number of successfully merged pull requests as the action output `merged-pr-count`
+9. Returns the number of merged and queued pull requests as the action outputs `merged-pr-count` and `queued-pr-count`
 
 ## Workflow Summary
 
@@ -273,6 +300,7 @@ The action generates a detailed workflow summary that includes:
 - Summary of eligible PRs found and how many will be merged
 - Detailed tables showing:
   - PRs that will be merged, with dependency information and version changes
+  - PRs that were added to a merge queue
   - PRs that were filtered out, with specific reasons why they didn't pass the filters (e.g., "Dependency X is in ignored list")
   - General status information such as whether PRs are in a mergeable state or have failing checks
 

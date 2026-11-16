@@ -22,7 +22,8 @@ describe('run', () => {
       },
       repos: {
         getCombinedStatusForRef: jest.fn(),
-        get: jest.fn()
+        get: jest.fn(),
+        getBranchRules: jest.fn()
       },
       checks: {
         listForRef: jest.fn()
@@ -112,6 +113,7 @@ describe('run', () => {
       updatePullRequestBranch: { pullRequest: { headRefOid: 'rebased123' } }
     });
     mockOctokit.rest.checks.listForRef.mockResolvedValue({ data: { check_runs: [] } });
+    mockOctokit.rest.repos.getBranchRules.mockResolvedValue({ data: [] });
   });
 
   test('handles direct token value', async () => {
@@ -408,45 +410,29 @@ describe('run', () => {
     process.env = originalEnv;
   });
   
-  test('should warn when merge queue is required but method is not merge', async () => {
-    // Setup mocks to correctly pass through findMergeablePRs
-    mockOctokit.rest.pulls.list.mockResolvedValue({
-      data: [
-        { 
-          number: 1, 
-          title: 'Bump axios from 0.21.0 to 0.21.1',
-          user: { login: 'dependabot[bot]' },
-          created_at: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString(),
-          head: { sha: 'abc123' },
-          mergeable: true,
-          mergeable_state: 'clean'
-        }
-      ]
-    });
-    
-    // Override the merge method to use squash
+  test('should fail with a hint when a direct merge is rejected by a merge queue rule', async () => {
     core.getInput.mockImplementation(name => {
-      if (name === 'merge-method') return 'squash';
+      if (name === 'merge-queue') return 'false';
       return defaultInputs[name] || '';
     });
-    
-    // Make the merge function throw an error that looks like a merge queue error
+
     mockOctokit.rest.pulls.merge.mockRejectedValue({
       status: 405,
-      message: 'Pull request requires merge queue'
+      message: 'Repository rule violations found\n\nChanges must be made through the merge queue'
     });
-    
+
     const result = await run();
-    
-    // Should detect merge queue error and warn about it
+
+    expect(mockOctokit.rest.repos.getBranchRules).not.toHaveBeenCalled();
     expect(mockOctokit.rest.pulls.merge).toHaveBeenCalled();
-    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('may require a merge queue, but merge method is set to'));
-    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('change the \'merge-method\' input to \'merge\''));
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('must be merged through a merge queue'));
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to merge PR #1'));
 
     expect(result).toBe(0);
     expect(core.setOutput).toHaveBeenCalledWith('merged-pr-count', 0);
+    expect(core.setOutput).toHaveBeenCalledWith('queued-pr-count', 0);
   });
-  
+
   describe('Multi-dependency PR handling', () => {
     test('should attempt to merge eligible multi-dependency pull requests', async () => {
       // Setup mock for a multi-dependency PR

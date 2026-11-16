@@ -38,7 +38,7 @@ inputs:
     required: false
     default: 'patch,minor'
   merge-method:
-    description: The merge method to use (merge, squash, rebase). Note that only 'merge' method is supported with GitHub merge queues.
+    description: The merge method to use for direct merges (merge, squash, rebase). Ignored for pull requests added to a merge queue, where the queue's own merge method applies.
     required: false
     default: 'merge'
   retry-delay-ms:
@@ -57,10 +57,16 @@ inputs:
     description: Maximum time in seconds to wait for an updated PR head and passing checks after rebasing
     required: false
     default: '300'
+  merge-queue:
+    description: How to handle merge queues. 'auto' detects a merge_queue rule on the base branch and adds pull requests to the queue, 'true' always enqueues, 'false' always merges directly
+    required: false
+    default: 'auto'
 
 outputs:
   merged-pr-count:
     description: The number of pull requests that were successfully merged during execution
+  queued-pr-count:
+    description: The number of pull requests that were added to a merge queue during execution
 
 runs:
   using: node24

@@ -566,6 +566,92 @@ async function updatePRBranch(octokit, pullNumber, prDetails) {
 }
 
 /**
+ * Parse the merge-queue input
+ *
+ * @param {string} value - Raw input value (auto, true, false)
+ * @returns {'auto'|'true'|'false'} Normalized mode
+ */
+function parseMergeQueueMode(value) {
+  const mode = (value || 'auto').trim().toLowerCase();
+  if (!['auto', 'true', 'false'].includes(mode)) {
+    throw new Error(`Invalid merge-queue value '${value}'. Expected one of: auto, true, false`);
+  }
+  return mode;
+}
+
+/**
+ * Check whether a branch requires a merge queue via repository rulesets.
+ * Results are cached per branch in the provided Map.
+ *
+ * @param {Object} octokit - GitHub API client
+ * @param {string} owner - Repository owner
+ * @param {string} repo - Repository name
+ * @param {string} branch - Branch name
+ * @param {Map<string, boolean>} cache - Per-run cache keyed by branch name
+ * @returns {Promise<boolean>} True if the branch has a merge_queue rule
+ */
+async function branchHasMergeQueue(octokit, owner, repo, branch, cache = new Map()) {
+  if (cache.has(branch)) {
+    return cache.get(branch);
+  }
+
+  let hasQueue = false;
+  try {
+    const { data: rules } = await octokit.rest.repos.getBranchRules({
+      owner,
+      repo,
+      branch,
+      per_page: 100
+    });
+    hasQueue = Array.isArray(rules) && rules.some(rule => rule.type === 'merge_queue');
+    core.info(`Branch '${branch}' ${hasQueue ? 'requires' : 'does not require'} a merge queue`);
+  } catch (error) {
+    core.warning(`Could not detect merge queue for branch '${branch}': ${error.message}. Falling back to direct merge.`);
+  }
+
+  cache.set(branch, hasQueue);
+  return hasQueue;
+}
+
+/**
+ * Add a pull request to the merge queue using the GraphQL API
+ *
+ * @param {Object} octokit - GitHub API client
+ * @param {Object} prDetails - Fresh PR details including node ID and head SHA
+ * @param {string} [expectedHeadOid] - Expected head SHA, defaults to prDetails.head.sha
+ * @returns {Promise<{position: number, state: string}>} The merge queue entry
+ * @throws {Error} If the PR could not be enqueued
+ */
+async function enqueuePullRequest(octokit, prDetails, expectedHeadOid) {
+  if (!prDetails?.node_id) {
+    throw new Error('Missing PR node ID');
+  }
+
+  const result = await octokit.graphql(`
+    mutation EnqueuePullRequest($pullRequestId: ID!, $expectedHeadOid: GitObjectID) {
+      enqueuePullRequest(input: {
+        pullRequestId: $pullRequestId,
+        expectedHeadOid: $expectedHeadOid
+      }) {
+        mergeQueueEntry {
+          position
+          state
+        }
+      }
+    }
+  `, {
+    pullRequestId: prDetails.node_id,
+    expectedHeadOid: expectedHeadOid ?? prDetails.head?.sha
+  });
+
+  const entry = result?.enqueuePullRequest?.mergeQueueEntry;
+  if (!entry) {
+    throw new Error('GitHub did not return a merge queue entry');
+  }
+  return entry;
+}
+
+/**
  * Wait for checks to pass after updating a PR branch
  *
  * @param {Object} octokit - GitHub API client
@@ -676,5 +762,8 @@ export {
   approvePullRequest,
   updatePRBranch,
   waitForChecksAfterUpdate,
-  evaluateChecks
+  evaluateChecks,
+  parseMergeQueueMode,
+  branchHasMergeQueue,
+  enqueuePullRequest
 };

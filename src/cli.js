@@ -1,7 +1,16 @@
 import { parseArgs } from 'node:util';
 import * as github from '@actions/github';
 import { fileURLToPath } from 'node:url';
-import { findMergeablePRs, approvePullRequest, checkPRMergeability, updatePRBranch, waitForChecksAfterUpdate } from './pullRequests.js';
+import {
+  findMergeablePRs,
+  approvePullRequest,
+  checkPRMergeability,
+  updatePRBranch,
+  waitForChecksAfterUpdate,
+  parseMergeQueueMode,
+  branchHasMergeQueue,
+  enqueuePullRequest
+} from './pullRequests.js';
 import { shouldRunAtCurrentTime } from './timeUtils.js';
 import { applyFilters, getAllFilterReasons } from './filters.js';
 
@@ -127,6 +136,8 @@ async function runCli(options) {
     // Create Octokit client
     const octokit = github.getOctokit(token);
 
+    const mergeQueueMode = parseMergeQueueMode(options.mergeQueue);
+
     // Prepare filter options
     const filterOptions = {
       ignoredDependencies: options.ignoredDependencies ? options.ignoredDependencies.split(',').map(d => d.trim()) : [],
@@ -144,6 +155,7 @@ async function runCli(options) {
     console.log(`   • Semver filter: ${filterOptions.semverFilter.join(', ')}`);
     console.log(`   • Auto-approve: ${options.autoApprove}`);
     console.log(`   • Update branch before merge: ${options.updateBranchBeforeMerge}`);
+    console.log(`   • Merge queue: ${mergeQueueMode}`);
     if (filterOptions.ignoredDependencies.length > 0) {
       console.log(`   • Ignored dependencies: ${filterOptions.ignoredDependencies.join(', ')}`);
     }
@@ -167,6 +179,7 @@ async function runCli(options) {
     }
 
     // Get repository info for default branch check
+    let defaultBranch;
     try {
       const { data: repoData } = await octokit.rest.repos.get({
         owner,
@@ -175,6 +188,7 @@ async function runCli(options) {
       console.log(`\n🏛️  Repository: ${repoData.full_name}`);
       console.log(`   • Default branch: ${repoData.default_branch}`);
       console.log(`   • Private: ${repoData.private}`);
+      defaultBranch = repoData.default_branch;
     } catch (error) {
       mockCore.warning(`Failed to get repository information: ${error.message}`);
     }
@@ -289,20 +303,27 @@ async function runCli(options) {
     } else {
       console.log(`\n🚀 Merging ${filteredPRs.length} PR(s)...`);
 
+      const mergeQueueCache = new Map();
+
       for (const pr of filteredPRs) {
         console.log(`\n⏳ Merging PR #${pr.number}: ${pr.title}`);
 
         let updatedHeadSha;
-        const freshPR = options.updateBranchBeforeMerge
+        const freshPR = options.updateBranchBeforeMerge || mergeQueueMode !== 'false'
           ? await checkPRMergeability(octokit, owner, repo, pr.number, options.retryDelayMs)
           : pr.prDetails;
 
-        if (options.updateBranchBeforeMerge && !freshPR?.mergeable) {
-          console.warn(`Skipping PR #${pr.number}: could not confirm mergeability before branch update`);
+        if ((options.updateBranchBeforeMerge || mergeQueueMode !== 'false') && !freshPR?.mergeable) {
+          console.warn(`Skipping PR #${pr.number}: could not confirm mergeability`);
           continue;
         }
 
-        if (options.updateBranchBeforeMerge && freshPR.mergeable_state === 'behind') {
+        const baseBranch = freshPR?.base?.ref || defaultBranch;
+        const useMergeQueue = mergeQueueMode === 'true' ||
+          (mergeQueueMode === 'auto' && baseBranch !== undefined &&
+            await branchHasMergeQueue(octokit, owner, repo, baseBranch, mergeQueueCache));
+
+        if (!useMergeQueue && options.updateBranchBeforeMerge && freshPR.mergeable_state === 'behind') {
           console.log(`   Updating branch for PR #${pr.number}...`);
           const updateSuccess = await updatePRBranch(octokit, pr.number, freshPR);
           if (!updateSuccess) {
@@ -323,6 +344,16 @@ async function runCli(options) {
             console.warn(`⚠️  Skipping PR #${pr.number}: auto-approval failed`);
             continue;
           }
+        }
+
+        if (useMergeQueue) {
+          try {
+            const entry = await enqueuePullRequest(octokit, freshPR, freshPR.head?.sha);
+            console.log(`✅ Added PR #${pr.number} to the merge queue (position: ${entry.position}, state: ${entry.state})`);
+          } catch (error) {
+            console.error(`❌ Failed to add PR #${pr.number} to the merge queue: ${error.message}`);
+          }
+          continue;
         }
 
         try {
@@ -373,6 +404,7 @@ Options for 'run':
   --auto-approve                     Automatically approve PRs before merging
   --update-branch-before-merge       Rebase PR branches onto the base branch before merging
   --max-update-wait-seconds <secs>   Max seconds to wait for rebased head and checks (default: 300)
+  --merge-queue <mode>               Merge queue handling: auto, true, false (default: auto)
   --no-dry-run                       Actually merge PRs (default is dry run)
   -v, --verbose                      Enable verbose logging
 `);
@@ -469,6 +501,7 @@ async function main() {
       'auto-approve':                 { type: 'boolean', default: false },
       'update-branch-before-merge':   { type: 'boolean', default: false },
       'max-update-wait-seconds':      { type: 'string', default: '300' },
+      'merge-queue':                  { type: 'string', default: 'auto' },
       verbose:                        { type: 'boolean', short: 'v', default: false },
     },
     allowPositionals: true,
@@ -499,6 +532,7 @@ async function main() {
     autoApprove:                 values['auto-approve'],
     updateBranchBeforeMerge:     values['update-branch-before-merge'],
     maxUpdateWaitSeconds:        parseInt(values['max-update-wait-seconds'], 10) || 300,
+    mergeQueue:                  values['merge-queue'],
     verbose:                     values['verbose'],
   });
 }

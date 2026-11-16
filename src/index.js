@@ -1,7 +1,16 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { fileURLToPath } from 'node:url';
-import { findMergeablePRs, approvePullRequest, checkPRMergeability, updatePRBranch, waitForChecksAfterUpdate } from './pullRequests.js';
+import {
+  findMergeablePRs,
+  approvePullRequest,
+  checkPRMergeability,
+  updatePRBranch,
+  waitForChecksAfterUpdate,
+  parseMergeQueueMode,
+  branchHasMergeQueue,
+  enqueuePullRequest
+} from './pullRequests.js';
 import { shouldRunAtCurrentTime } from './timeUtils.js';
 import { applyFilters, recordFilterReason } from './filters.js';
 import { addWorkflowSummary } from './summary.js';
@@ -41,6 +50,7 @@ async function run() {
     const updateBranchBeforeMerge = core.getInput('update-branch-before-merge') === 'true';
     const parsedMaxUpdateWait = parseInt(core.getInput('max-update-wait-seconds'), 10);
     const maxUpdateWaitSeconds = Number.isNaN(parsedMaxUpdateWait) ? 300 : parsedMaxUpdateWait;
+    const mergeQueueMode = parseMergeQueueMode(core.getInput('merge-queue'));
     
     // Prepare filter options - we'll use this regardless of whether we're in a blackout period
     const filterOptions = {
@@ -58,6 +68,10 @@ async function run() {
     let initialPRs = [];
     let mergedPRCount = 0;
     const mergedPRNumbers = new Set();
+    let queuedPRCount = 0;
+    const queuedPRNumbers = new Set();
+    const mergeQueueCache = new Map();
+    let defaultBranchName;
 
     // Check if the action should run at the current time
     if (!shouldRunAtCurrentTime(blackoutPeriods)) {
@@ -80,13 +94,17 @@ async function run() {
         if (currentRef !== defaultBranch) {
           core.warning(`Action is not running from the default branch (${repo.default_branch}). Current ref: ${currentRef}. Skipping execution for security reasons.`);
           core.setOutput('merged-pr-count', 0);
+          core.setOutput('queued-pr-count', 0);
           return 0;
         }
+
+        defaultBranchName = repo.default_branch;
         
         core.info(`Action is running from the default branch (${repo.default_branch}). Proceeding with execution.`);
       } catch (error) {
         core.warning(`Failed to verify default branch: ${error.message}. Skipping execution for security reasons.`);
         core.setOutput('merged-pr-count', 0);
+        core.setOutput('queued-pr-count', 0);
         return 0;
       }
       
@@ -140,10 +158,15 @@ async function run() {
             continue;
           }
 
+          const baseBranch = freshPRDetails.base?.ref || defaultBranchName;
+          const useMergeQueue = mergeQueueMode === 'true' ||
+            (mergeQueueMode === 'auto' && baseBranch !== undefined &&
+              await branchHasMergeQueue(octokit, context.repo.owner, context.repo.repo, baseBranch, mergeQueueCache));
+
           let updatedHeadSha;
 
-          // Check if branch needs updating and update-branch-before-merge is enabled
-          if (updateBranchBeforeMerge && freshPRDetails.mergeable_state === 'behind') {
+          // The merge queue tests against the latest base branch itself, so no branch update is needed
+          if (!useMergeQueue && updateBranchBeforeMerge && freshPRDetails.mergeable_state === 'behind') {
             core.info(`PR #${pr.number} branch is behind base branch. Updating...`);
             
             const updateSuccess = await updatePRBranch(
@@ -192,6 +215,26 @@ async function run() {
               recordFilterReason(pr.number, 'merge', 'Auto-approval failed');
               continue;
             }
+          }
+
+          if (useMergeQueue) {
+            try {
+              core.info(`Adding PR #${pr.number} to the merge queue: ${pr.title}`);
+              const entry = await enqueuePullRequest(octokit, freshPRDetails, updatedHeadSha ?? freshPRDetails.head?.sha);
+              core.info(`Added PR #${pr.number} to the merge queue (position: ${entry.position}, state: ${entry.state})`);
+              queuedPRCount++;
+              queuedPRNumbers.add(pr.number);
+            } catch (error) {
+              if (/already (in|added to) the merge queue|already queued/i.test(error.message || '')) {
+                core.info(`PR #${pr.number} is already in the merge queue`);
+                queuedPRCount++;
+                queuedPRNumbers.add(pr.number);
+              } else {
+                core.setFailed(`Failed to add PR #${pr.number} to the merge queue: ${error.message}`);
+                recordFilterReason(pr.number, 'merge', `Enqueue failed: ${error.message}`);
+              }
+            }
+            continue;
           }
 
             try {
@@ -270,22 +313,10 @@ async function run() {
                     await new Promise(resolve => setTimeout(resolve, retryDelayMs));
                   }
                 } else {
-                  // Check for merge queue warnings in the error message
-                  const isMergeQueueError = 
-                    (mergeError.message && (
-                      mergeError.message.toLowerCase().includes('merge queue') || 
-                      mergeError.message.toLowerCase().includes('branch protection') ||
-                      mergeError.message.toLowerCase().includes('required status check')
-                    )) ||
-                    (mergeError.status === 405 || mergeError.status === 422);
-                  
-                  // If this appears to be a merge queue error and merge method isn't 'merge'
-                  if (isMergeQueueError && mergeMethod !== 'merge') {
-                    core.warning(`PR #${pr.number} may require a merge queue, but merge method is set to '${mergeMethod}'. Only 'merge' method is supported with merge queues.`);
-                    core.warning('To use merge queues, change the \'merge-method\' input to \'merge\' in your workflow configuration.');
+                  if (mergeError.message && mergeError.message.toLowerCase().includes('merge queue')) {
+                    core.warning(`PR #${pr.number} must be merged through a merge queue. Set the 'merge-queue' input to 'auto' or 'true' to add it to the queue instead.`);
                   }
-                  
-                  // Always throw the error since we're not handling other types of merge errors
+
                   throw mergeError;
                 }
               }
@@ -299,16 +330,17 @@ async function run() {
     }
     
     // Always add workflow summary at the end with the final state
-    await addWorkflowSummary(pullRequests, filteredPRs, mergedPRNumbers, filterOptions, initialPRs);
+    await addWorkflowSummary(pullRequests, filteredPRs, mergedPRNumbers, filterOptions, initialPRs, queuedPRNumbers);
     
-    // Set the output for the number of merged PRs
     core.setOutput('merged-pr-count', mergedPRCount);
+    core.setOutput('queued-pr-count', queuedPRCount);
 
     return mergedPRCount;
 
   } catch (error) {
     core.setFailed(`Action failed: ${error.message}`);
     core.setOutput('merged-pr-count', 0);
+    core.setOutput('queued-pr-count', 0);
     return 0;
   }
 }
